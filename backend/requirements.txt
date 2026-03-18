@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+python-multipart
+pandas
+numpy
+langchain
+langchain-groq
+groq
+tabulate
+python-dotenv
