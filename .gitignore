@@ -1,12 +1,28 @@
 # Python
 backend/venv/
 backend/__pycache__/
+backend/*.pyc
+backend/.pytest_cache/
 .env
+*.log
+
+# Data (CRITICAL for Fintech)
+*.csv
+*.xlsx
+*.json
+!backend/sample_schema.json  # Use ! to allow specific, safe config files
 
 # Next.js
 frontend/node_modules/
 frontend/.next/
+frontend/out/
+frontend/build/
+frontend/.env*
 frontend/.env.local
 
-# OS
+# IDEs & OS
+.vscode/
+.idea/
 .DS_Store
+*.swp
+.cursor/
