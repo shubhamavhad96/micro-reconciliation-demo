@@ -3,16 +3,36 @@ from __future__ import annotations
 import io
 import json
 import os
-from typing import Any
+import traceback
+import uuid
+from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from langchain_groq import ChatGroq
 
-from security import mask_pii_in_dataframe_with_audit
+from security import (
+    add_stripe_fee_fuzzy_fields,
+    hitl_header_mapping_system_prompt,
+    mask_pii_in_dataframe_with_audit,
+    normalize_hitl_llm_mapping,
+    sample_masked_dataframe_for_llm,
+)
+
+# Schema sampling: LLM sees only a small row slice; full file is mapped with pandas.
+LARGE_FILE_BYTES = 5 * 1024 * 1024  # 5MB — use minimal rows for LLM prompt
+LLM_SAMPLE_ROWS_NORMAL = 10
+LLM_SAMPLE_ROWS_LARGE_FILE = 3
+RESPONSE_PREVIEW_ROW_LIMIT = 100
+
+# ``task_id`` -> ``{status, progress, result, error}``. Single-process only:
+# not shared across workers; clients poll ``GET /api/status/{task_id}``. No
+# persistence—acceptable for local demos, wrong for multi-instance production.
+TASK_STORE: dict[str, dict[str, Any]] = {}
 
 
 # Load environment variables from .env as early as possible
@@ -39,13 +59,30 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+def _extract_json_object_from_llm(content: str) -> dict[str, Any]:
+    """Strip optional markdown fences and parse the LLM JSON object."""
+    text = (content or "").strip()
+    if text.startswith("```"):
+        lines = text.split("\n")
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    parsed = json.loads(text)
+    if not isinstance(parsed, dict):
+        raise ValueError("LLM response JSON was not an object.")
+    return parsed
+
+
 def _map_headers_with_llama_3_1(markdown_preview: str) -> dict[str, Any]:
     """
     Map messy CSV headers to the canonical ledger schema using Llama 3.1.
 
-    Model output is untrusted. We accept only a JSON object and reject empty
-    or non-object responses. The prompt asks the model to use ``null`` for
-    fields it cannot map with confidence, which becomes our confidence signal.
+    Model output is untrusted. We accept only a JSON object. The prompt
+    (from ``security.hitl_header_mapping_system_prompt``) asks for per-field
+    ``source_column``, ``confidence_score`` (0–100), and ``status``; the
+    endpoint normalizes scores and re-derives ``status`` from strict thresholds.
 
     Fallback logic is enforced in the endpoint: mappings are applied only
     when the referenced source column exists in the uploaded DataFrame.
@@ -59,29 +96,16 @@ def _map_headers_with_llama_3_1(markdown_preview: str) -> dict[str, Any]:
     Parameters
     ----------
     markdown_preview:
-        A small redacted markdown table (headers + a few rows) derived from
-        the uploaded CSV. Redaction must happen before calling the model.
+        A small redacted markdown table (headers + sample rows) derived from
+        the uploaded CSV. Typically 10 rows (or 3 when the upload exceeds
+        5MB). Redaction must happen before calling the model.
 
     Returns
     -------
     dict[str, Any]
-        A mapping object with keys for the canonical fields.
+        Raw HITL mapping object from the model (parsed JSON).
     """
-    system_instruction = (
-        "You are a financial data normalization assistant. "
-        "You are given a markdown table representing CSV headers and sample rows. "
-        "Your task is to map the messy CSV headers to the following exact JSON schema:\n\n"
-        "{\n"
-        '  "date": "YYYY-MM-DD",\n'
-        '  "amount": "float",\n'
-        '  "description": "string",\n'
-        '  "transaction_type": "credit/debit"\n'
-        "}\n\n"
-        "Return only a single valid JSON object that uses the CSV column names as "
-        "values for this schema (e.g. {\"date\": \"txn_date\", ...}). "
-        "If a field cannot be confidently mapped, set its value to null. "
-        "Do not include any explanations, comments, or extra text—only the JSON object."
-    )
+    system_instruction = hitl_header_mapping_system_prompt()
 
     user_message = (
         "Here is the CSV sample in markdown format:\n\n"
@@ -100,137 +124,134 @@ def _map_headers_with_llama_3_1(markdown_preview: str) -> dict[str, Any]:
     if not content:
         raise ValueError("Empty response from LLM.")
 
-    mapping = json.loads(content)
-    if not isinstance(mapping, dict):
-        raise ValueError("LLM response JSON was not an object.")
-
-    return mapping
+    return _extract_json_object_from_llm(content)
 
 
-@app.post("/reconcile")
-async def reconcile(file: UploadFile = File(...)) -> dict[str, Any]:
+def _set_task_progress(task_id: str, progress: int) -> None:
+    """Clamp and write pipeline progress for polling clients.
+
+    Idempotent if ``task_id`` is missing (e.g. race during teardown). Values
+    are integers in ``[0, 100]`` so the UI can render a deterministic bar.
+
+    Args:
+        task_id: UUID string returned in the 202 response.
+        progress: Monotonic-ish percentage from the worker (clamped here).
     """
-    Reconcile a user-provided CSV into a canonical ledger row shape.
+    if task_id in TASK_STORE:
+        TASK_STORE[task_id]["progress"] = min(100, max(0, int(progress)))
 
-    This endpoint is stateless: it computes transformations and audit
-    messages from the uploaded file and returns them in the response payload
-    (no database writes).
 
-    Payload constraints
-    --------------------
-    - Request method: ``POST /reconcile``
-    - Content type: ``multipart/form-data``
-    - Form field name: ``file``
-    - Filename must end with ``.csv``
-    - Body is decoded as UTF-8 using ``utf-8-sig`` before parsing with pandas.
-    - Maximum upload size is enforced by FastAPI/Starlette and any reverse
-      proxy. If the request body is too large, clients may receive ``413``.
+def run_reconcile_pipeline(
+    raw: bytes,
+    on_progress: Callable[[int], None] | None = None,
+) -> dict[str, Any]:
+    """Execute the full reconcile path on uploaded bytes (sync; CPU/IO bound).
 
-    Security controls (SOC2-oriented)
-    --------------------------------
-    - PII masking happens locally via regex *before* the prompt payload is
-      built for the LLM.
-    - We prefer regex false positives over data leakage. Over-masking is
-      safer than sending raw account numbers or emails to an external model.
+    Stages: UTF-8 decode → ``read_csv`` → PII mask (regex, local) → bounded
+    schema sample → Groq/Llama HITL JSON → :func:`normalize_hitl_llm_mapping`
+    → pandas column rename and value normalization →
+    :func:`add_stripe_fee_fuzzy_fields` → preview slice (``RESPONSE_PREVIEW_ROW_LIMIT``).
 
-    LLM safety and fallback logic
-    ------------------------------
-    - The LLM output is treated as untrusted.
-    - We parse the model output as JSON and reject non-object responses.
-    - The endpoint applies mappings only when the referenced source column
-      exists in the uploaded DataFrame. If the model hallucinates column
-      names, canonical fields stay ``None``/``N/A``.
+    ``on_progress``, when provided, receives coarse percentages (0, 5, 10, 50,
+    90, 100) for the async worker to persist in ``TASK_STORE``; it must stay
+    cheap (no I/O).
 
-    HTTP error codes
-    -----------------
-    - ``400``: malformed input (non-CSV filename, empty upload, UTF-8 decode
-      errors, CSV parse errors, or empty/invalid DataFrame for masking and
-      normalization).
-    - ``413``: request payload too large (FastAPI/Starlette or proxy).
-    - ``500``: LLM mapping failures (including provider timeouts), invalid
-      JSON from the model, or internal normalization errors.
+    Raises:
+        ValueError: Input/parse/mask errors that should surface as a failed task
+            with a client-readable message (bad encoding, empty frame, etc.).
+        RuntimeError: Downstream failures (LLM, normalization) where the client
+            still sees ``failed`` but the message may be technical.
 
-    Parameters
-    ----------
-    file:
-        Uploaded CSV file provided via multipart/form-data.
-
-    Returns
-    -------
-    dict[str, Any]
-        A response object containing:
-        - ``mapped_data``: standardized rows suitable for ledger ingestion.
-        - ``audit_trail``: a non-sensitive explanation of masking and header mapping.
+    Returns:
+        Dict with ``mapped_data``, ``total_rows``, ``hitl_mapping``, ``audit_trail``
+        (same contract as the pre-async API body under ``result``).
     """
-    filename = file.filename or "upload.csv"
-    if not filename.lower().endswith(".csv"):
-        raise HTTPException(status_code=400, detail="Please upload a .csv file.")
+    def p(percent: int) -> None:
+        if on_progress:
+            on_progress(percent)
 
-    raw = await file.read()
-    if not raw:
-        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+    p(0)
 
     try:
         text = raw.decode("utf-8-sig")
-    except UnicodeDecodeError:
-        raise HTTPException(
-            status_code=400,
-            detail="CSV must be UTF-8 encoded.",
-        )
+    except UnicodeDecodeError as exc:
+        raise ValueError("CSV must be UTF-8 encoded.") from exc
 
-    # Read CSV into Pandas DataFrame
     try:
         df = pd.read_csv(io.StringIO(text))
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Failed to parse CSV: {exc}")
+        raise ValueError(f"Failed to parse CSV: {exc}") from exc
 
-    # Mask PII using shared helper (+ capture audit events)
+    p(5)
+
     try:
         masked_df, audit_trail = mask_pii_in_dataframe_with_audit(df)
     except ValueError as exc:
-        # Empty or invalid DataFrame
-        raise HTTPException(status_code=400, detail=str(exc))
+        raise ValueError(str(exc)) from exc
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Failed to mask PII: {exc}")
+        raise RuntimeError(f"Failed to mask PII: {exc}") from exc
 
-    # Build markdown preview from headers and first 3 rows
+    large_file = len(raw) > LARGE_FILE_BYTES
+    llm_row_count = LLM_SAMPLE_ROWS_LARGE_FILE if large_file else LLM_SAMPLE_ROWS_NORMAL
     try:
-        preview_df = masked_df.head(3)
+        preview_df = sample_masked_dataframe_for_llm(masked_df, llm_row_count)
         markdown_preview = preview_df.to_markdown(index=False)
     except Exception as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to build markdown preview: {exc}",
-        )
+        raise RuntimeError(f"Failed to build markdown preview: {exc}") from exc
+
+    audit_trail.append(
+        {
+            "action": "schema_sampling",
+            "llm_sample_rows": llm_row_count,
+            "total_rows_in_file": int(len(masked_df)),
+            "large_file_threshold_bytes": LARGE_FILE_BYTES,
+            "large_file_prompt_trim": large_file,
+        }
+    )
 
     try:
-        mapping = _map_headers_with_llama_3_1(markdown_preview)
+        raw_mapping = _map_headers_with_llama_3_1(markdown_preview)
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"LLM mapping failed: {exc}")
+        raise RuntimeError(f"LLM mapping failed: {exc}") from exc
 
-    # Record LLM mapping decisions for auditability.
-    for target_field in ("date", "amount", "description", "transaction_type"):
-        original_col = mapping.get(target_field)
+    try:
+        field_sources, hitl_mapping = normalize_hitl_llm_mapping(
+            raw_mapping, masked_df.columns
+        )
+    except Exception as exc:
+        raise RuntimeError(f"HITL mapping normalization failed: {exc}") from exc
+
+    p(10)
+
+    lowest_confidence = min(
+        int(hitl_mapping[f]["confidence_score"]) for f in hitl_mapping
+    )
+    audit_trail.append(
+        {
+            "action": "hitl_evaluation",
+            "lowest_confidence_score": lowest_confidence,
+        }
+    )
+
+    for target_field, meta in hitl_mapping.items():
         audit_trail.append(
             {
                 "action": "header_mapping",
-                "original_col": original_col,
+                "original_col": meta.get("source_column"),
                 "mapped_to": target_field,
+                "confidence_score": meta.get("confidence_score"),
+                "status": meta.get("status"),
                 "reason": "Semantic match",
             }
         )
 
-    # Apply mapping to DataFrame columns.
-    # Expected shape: {"date": "orig_date_col", "amount": "orig_amount_col", ...}
     rename_map: dict[str, str] = {}
-    for target_field in ("date", "amount", "description", "transaction_type"):
-        source_name = mapping.get(target_field)
+    for target_field, source_name in field_sources.items():
         if isinstance(source_name, str) and source_name in masked_df.columns:
             rename_map[source_name] = target_field
 
     standardized_df = masked_df.rename(columns=rename_map)
 
-    # Ensure all standard columns exist; fill missing ones.
     if "transaction_type" not in standardized_df.columns:
         standardized_df["transaction_type"] = "N/A"
     if "date" not in standardized_df.columns:
@@ -240,8 +261,8 @@ async def reconcile(file: UploadFile = File(...)) -> dict[str, Any]:
     if "description" not in standardized_df.columns:
         standardized_df["description"] = None
 
-    # --- Value normalization ---
-    # 1) date -> YYYY-MM-DD (string), robust to mixed formats
+    p(50)
+
     try:
         dates = pd.to_datetime(
             standardized_df["date"],
@@ -252,18 +273,16 @@ async def reconcile(file: UploadFile = File(...)) -> dict[str, Any]:
             dates.notna(), "Invalid Date"
         )
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Failed to normalize date: {exc}")
+        raise RuntimeError(f"Failed to normalize date: {exc}") from exc
 
-    # 2) amount -> float (strip currency symbols, commas, plus signs)
     try:
         amount_raw = standardized_df["amount"].astype("string")
         amount_clean = amount_raw.str.replace(r"[^\d\.\-]", "", regex=True)
         amount_num = pd.to_numeric(amount_clean, errors="coerce")
         standardized_df["amount"] = amount_num
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Failed to normalize amount: {exc}")
+        raise RuntimeError(f"Failed to normalize amount: {exc}") from exc
 
-    # 3) transaction_type -> credit/debit based on sign of amount
     try:
         standardized_df["transaction_type"] = np.where(
             standardized_df["amount"].isna(),
@@ -271,18 +290,153 @@ async def reconcile(file: UploadFile = File(...)) -> dict[str, Any]:
             np.where(standardized_df["amount"] >= 0, "credit", "debit"),
         )
     except Exception as exc:
-        raise HTTPException(
-            status_code=500, detail=f"Failed to infer transaction_type: {exc}"
-        )
+        raise RuntimeError(f"Failed to infer transaction_type: {exc}") from exc
 
-    # Reorder and filter to the canonical schema
+    try:
+        standardized_df = add_stripe_fee_fuzzy_fields(standardized_df)
+    except Exception as exc:
+        raise RuntimeError(f"Failed to compute fee match fields: {exc}") from exc
+
+    p(90)
+
     standardized_df = standardized_df[
-        ["date", "amount", "description", "transaction_type"]
+        [
+            "date",
+            "amount",
+            "description",
+            "transaction_type",
+            "has_fee_discrepancy",
+            "suggested_gross",
+            "detected_fee",
+        ]
     ]
 
-    # Convert to list-of-dicts for the API response
     standardized_df = standardized_df.replace({np.nan: None})
     records = standardized_df.to_dict(orient="records")
-    return {"mapped_data": records, "audit_trail": audit_trail}
+    total_rows = len(records)
+    if total_rows > RESPONSE_PREVIEW_ROW_LIMIT:
+        preview_records = records[:RESPONSE_PREVIEW_ROW_LIMIT]
+    else:
+        preview_records = records
+
+    p(100)
+
+    return {
+        "mapped_data": preview_records,
+        "total_rows": total_rows,
+        "hitl_mapping": hitl_mapping,
+        "audit_trail": audit_trail,
+    }
+
+
+def run_reconcile_background(task_id: str, raw: bytes) -> None:
+    """Run :func:`run_reconcile_pipeline` after the HTTP response has been sent.
+
+    FastAPI schedules this in a thread pool via ``BackgroundTasks`` so the
+    ``POST /reconcile`` handler returns **202** immediately after reading the
+    body—no blocking on LLM or large pandas work. Outcomes are written only to
+    ``TASK_STORE[task_id]``: ``completed`` + ``result`` on success, ``failed``
+    + ``error`` on ``ValueError`` or any other exception (server errors include
+    traceback text for debugging; trim before external exposure if needed).
+
+    Args:
+        task_id: Key initialized in ``TASK_STORE`` before enqueue.
+        raw: Raw CSV bytes (already fully read in the request handler).
+
+    Note:
+        Not durable: process restart drops all tasks. No authentication on
+        ``task_id``—treat IDs as unguessable UUIDs only for demo scope.
+    """
+    try:
+
+        def on_progress(percent: int) -> None:
+            _set_task_progress(task_id, percent)
+
+        result = run_reconcile_pipeline(raw, on_progress=on_progress)
+        TASK_STORE[task_id] = {
+            "status": "completed",
+            "progress": 100,
+            "result": result,
+            "error": None,
+        }
+    except ValueError as exc:
+        TASK_STORE[task_id] = {
+            "status": "failed",
+            "progress": TASK_STORE.get(task_id, {}).get("progress", 0),
+            "result": None,
+            "error": str(exc),
+        }
+    except Exception as exc:
+        TASK_STORE[task_id] = {
+            "status": "failed",
+            "progress": TASK_STORE.get(task_id, {}).get("progress", 0),
+            "result": None,
+            "error": f"{exc}\n{traceback.format_exc()}",
+        }
+
+
+@app.post("/reconcile")
+async def reconcile(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+) -> JSONResponse:
+    """Enqueue reconciliation; respond immediately with a pollable task id.
+
+    Validates extension and non-empty body synchronously. Persists bytes only in
+    the closure passed to ``BackgroundTasks``—the heavy pipeline runs after the
+    response is flushed, so the client does not block on LLM or dataframe work.
+
+    Returns:
+        JSONResponse with status **202** and body ``{task_id, status: "processing"}``.
+
+    Note:
+        ``TASK_STORE`` must be populated before ``add_task`` so the first poll
+        always sees ``processing``. For production, replace with a queue + worker
+        and authN on task access.
+    """
+    filename = file.filename or "upload.csv"
+    if not filename.lower().endswith(".csv"):
+        raise HTTPException(status_code=400, detail="Please upload a .csv file.")
+
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+
+    task_id = str(uuid.uuid4())
+    TASK_STORE[task_id] = {
+        "status": "processing",
+        "progress": 0,
+        "result": None,
+        "error": None,
+    }
+    background_tasks.add_task(run_reconcile_background, task_id, raw)
+
+    return JSONResponse(
+        status_code=202,
+        content={"task_id": task_id, "status": "processing"},
+    )
+
+
+@app.get("/api/status/{task_id}")
+def get_task_status(task_id: str) -> dict[str, Any]:
+    """Return the latest snapshot for ``task_id`` (polling endpoint).
+
+    Reads ``TASK_STORE`` only; no side effects. Typical fields: ``status``
+    (``processing`` | ``completed`` | ``failed``), ``progress`` (0–100),
+    ``result`` (payload when completed), ``error`` (when failed). **404** if the
+    id was never issued or expired after restart.
+
+    Args:
+        task_id: UUID from the 202 body.
+
+    Returns:
+        Mutable dict stored in ``TASK_STORE`` (clients should treat as read-only).
+
+    Raises:
+        HTTPException: 404 when unknown.
+    """
+    if task_id not in TASK_STORE:
+        raise HTTPException(status_code=404, detail="Unknown task_id.")
+    return TASK_STORE[task_id]
 
 
